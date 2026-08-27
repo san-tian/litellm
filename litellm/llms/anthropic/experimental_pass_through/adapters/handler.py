@@ -334,6 +334,14 @@ class LiteLLMMessagesToCompletionTransformationHandler:
         If the user provides a `summary` field in the thinking dict, it is passed
         through to the OpenAI reasoning params (opt-in per OpenAI spec).
         """
+        if litellm.use_chat_completions_url_for_anthropic_messages:
+            # User explicitly opted into chat/completions for /v1/messages; do not
+            # force the Responses API route. This matters for OpenAI-compatible
+            # backends (e.g. GLM via sglang) whose chat/completions already return
+            # reasoning_content, and whose /v1/responses reasoning item shape may
+            # not match OpenAI's (summary vs content), causing "Unknown items".
+            return
+
         custom_llm_provider = completion_kwargs.get("custom_llm_provider")
         if custom_llm_provider is None:
             try:
