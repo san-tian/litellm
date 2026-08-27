@@ -1,4 +1,5 @@
 import enum
+import re
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 from pydantic import BaseModel
@@ -181,6 +182,15 @@ class MCPCredentials(TypedDict, total=False):
     ``audience``, which is the RFC 8693 token-exchange parameter.
     """
 
+    upstream_token_header: str | None  # writable-ok: pydantic warns it cannot honour ReadOnly here
+    """
+    Which upstream header carries the credential LiteLLM resolves for this server. Omitted when
+    unset, which keeps RFC 6750's default of ``Authorization``. Set it when the upstream expects the
+    gateway's token somewhere else (an ESB terminating its own credential on e.g. ``esb-oauth``), so
+    a separate operator-configured ``Authorization`` reaches the origin untouched. Non-secret, so it
+    is stored in plaintext and returned on admin reads.
+    """
+
     client_private_key: str | None
     """
     PEM private key used to sign the private-key-JWT client_assertion (RFC 7523)
@@ -223,7 +233,23 @@ class MCPCredentials(TypedDict, total=False):
     """
 
 
-MCP_ADMIN_CONFIG_CREDENTIAL_KEYS: Final[tuple[str, ...]] = ("upstream_resource",)
+DEFAULT_CREDENTIAL_HEADER: Final = "Authorization"
+
+_HEADER_NAME_TOKEN: Final = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
+
+def normalize_upstream_header_name(raw: str) -> str | None:
+    """The trimmed header name if it is a usable RFC 7230 ``token``, else None.
+
+    One owner for the grammar; each caller picks its own failure shape (a config-load raise, an
+    API 400, a typed CredError). An operator-supplied name reaches egress verbatim, so a value
+    carrying CR/LF, spaces or separators must never get that far.
+    """
+    stripped: Final = raw.strip()
+    return stripped if stripped and _HEADER_NAME_TOKEN.match(stripped) else None
+
+
+MCP_ADMIN_CONFIG_CREDENTIAL_KEYS: Final[tuple[str, ...]] = ("upstream_resource", "upstream_token_header")
 """Non-secret credential keys returned on read so the admin form can show and clear them. Mirrors
 ``ADMIN_CONFIG_CREDENTIAL_KEYS`` in ``ui/litellm-dashboard/src/components/mcp_tools/types.tsx``."""
 

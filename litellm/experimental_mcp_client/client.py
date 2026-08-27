@@ -273,6 +273,7 @@ class MCPClient:
         transport_type: MCPTransportType = MCPTransport.http,
         auth_type: MCPAuthType = None,
         auth_value: str | dict[str, str] | None = None,
+        auth_header_name: str | None = None,
         timeout: float | None = None,
         stdio_config: MCPStdioConfig | None = None,
         extra_headers: dict[str, str] | None = None,
@@ -288,6 +289,10 @@ class MCPClient:
         self.auth_type: MCPAuthType = auth_type
         self.timeout: float = timeout if timeout is not None else MCP_CLIENT_TIMEOUT
         self._mcp_auth_value: str | dict[str, str] | None = None
+        # Which header ``_get_auth_headers`` writes the credential into, overriding the auth_type
+        # default. Set only for credentials the gateway resolved from its own config, never for a
+        # caller-supplied one.
+        self._auth_header_name: str | None = auth_header_name
         self.stdio_config: MCPStdioConfig | None = stdio_config
         self.extra_headers: dict[str, str] | None = extra_headers
         self.ssl_verify: VerifyTypes | None = ssl_verify
@@ -501,35 +506,71 @@ class MCPClient:
         else:
             self._mcp_auth_value = mcp_auth_value
 
+    def _header_slot(self, default: str) -> str:
+        return self._auth_header_name or default
+
     def _get_auth_headers(self) -> dict:
         """Generate authentication headers based on auth type."""
         headers: Final = {}
         if self._mcp_auth_value:
             if isinstance(self._mcp_auth_value, str):
                 if self.auth_type == MCPAuth.bearer_token:
-                    headers["Authorization"] = f"Bearer {strip_auth_scheme(self._mcp_auth_value, 'Bearer')}"
+                    static_bearer: Final = strip_auth_scheme(self._mcp_auth_value, "Bearer")
+                    headers[self._header_slot("Authorization")] = f"Bearer {static_bearer}"
                 elif self.auth_type == MCPAuth.basic:
-                    headers["Authorization"] = f"Basic {self._mcp_auth_value}"
+                    headers[self._header_slot("Authorization")] = f"Basic {self._mcp_auth_value}"
                 elif self.auth_type == MCPAuth.api_key:
-                    headers["X-API-Key"] = self._mcp_auth_value
+                    headers[self._header_slot("X-API-Key")] = self._mcp_auth_value
                 elif self.auth_type == MCPAuth.authorization:
                     # This auth type means the caller owns the whole header value.
-                    headers["Authorization"] = self._mcp_auth_value
+                    headers[self._header_slot("Authorization")] = self._mcp_auth_value
                 elif self.auth_type == MCPAuth.oauth2:
-                    headers["Authorization"] = f"Bearer {strip_auth_scheme(self._mcp_auth_value, 'Bearer')}"
+                    oauth2_bearer: Final = strip_auth_scheme(self._mcp_auth_value, "Bearer")
+                    headers[self._header_slot("Authorization")] = f"Bearer {oauth2_bearer}"
                 elif self.auth_type == MCPAuth.token:
-                    headers["Authorization"] = f"token {strip_auth_scheme(self._mcp_auth_value, 'token')}"
+                    scheme_token: Final = strip_auth_scheme(self._mcp_auth_value, "token")
+                    headers[self._header_slot("Authorization")] = f"token {scheme_token}"
                 elif self.auth_type == MCPAuth.oauth2_token_exchange:
-                    headers["Authorization"] = f"Bearer {strip_auth_scheme(self._mcp_auth_value, 'Bearer')}"
+                    exchanged_bearer: Final = strip_auth_scheme(self._mcp_auth_value, "Bearer")
+                    headers[self._header_slot("Authorization")] = f"Bearer {exchanged_bearer}"
             elif isinstance(self._mcp_auth_value, dict):
                 headers.update(self._mcp_auth_value)
+        headers_before_extra: Final = dict(headers)
         # Note: aws_sigv4 auth is not handled here — SigV4 requires per-request
         # signing (including the body hash), so it uses httpx.Auth flow instead
         # of static headers. See MCPSigV4Auth and _create_httpx_client_factory().
         # update the headers with the extra headers
         if self.extra_headers:
             headers.update(self.extra_headers)
+        slot: Final = self._auth_header_name
+        if slot and slot in headers_before_extra:
+            # Mirrors _resolve_v2_auth on the v2 path: when the operator named a slot for the
+            # credential the gateway resolved, a static or forwarded header must not shadow it.
+            # Without the slot configured the old precedence stands, so nothing else changes.
+            headers[slot] = headers_before_extra[slot]
         return _strip_header_whitespace(headers)
+
+    def _guarded_credential_header(self, auth: httpx.Auth | None) -> str | None:
+        """The non-Authorization header this client's credential rides in, if any.
+
+        httpx drops ``Authorization`` when a redirect crosses origin but keeps every other header, so
+        a credential the operator moved to its own slot would be replayed to whatever host the
+        upstream redirects to. Only a custom slot needs guarding; ``Authorization`` is already
+        covered by httpx itself.
+        """
+        name: Final = self._auth_header_name or getattr(auth, "header_name", None)
+        if not isinstance(name, str) or not name or name.lower() == "authorization":
+            return None
+        return name
+
+    def _cross_origin_credential_guard(self, header_name: str) -> Callable[[httpx.Request], Awaitable[None]]:
+        origin: Final = httpx.URL(self.server_url).host if self.server_url else None
+
+        async def guard(request: httpx.Request) -> None:
+            if origin and request.url.host != origin and header_name in request.headers:
+                del request.headers[header_name]
+
+        return guard
 
     def _create_httpx_client_factory(self) -> Callable[..., httpx.AsyncClient]:
         """
@@ -556,12 +597,14 @@ class MCPClient:
             # SigV4 aws_auth. Both are None for the common case — no behavior change.
             fallback_auth: Final = self._resolved_auth if self._resolved_auth is not None else self._aws_auth
             effective_auth: Final = auth if auth is not None else fallback_auth
+            guarded: Final = self._guarded_credential_header(effective_auth)
             return httpx.AsyncClient(
                 headers=headers,
                 timeout=timeout,
                 auth=effective_auth,
                 verify=ssl_config,
                 follow_redirects=True,
+                event_hooks={"request": [self._cross_origin_credential_guard(guarded)]} if guarded else {},
             )
 
         return factory
