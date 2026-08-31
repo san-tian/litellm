@@ -7333,8 +7333,10 @@ class Router:
             if status_code not in (401, 403):
                 raise error
 
-        if isinstance(error, litellm.NotFoundError):
-            raise error
+        # 404 (NotFoundError) is retryable — see litellm._should_retry. Model
+        # aggregators transiently return 404 when an upstream deployment is
+        # briefly unavailable; allow the router to retry (same/other deployments
+        # and fallbacks) instead of hard-failing.
         # Error we should only retry if there are other deployments
         if isinstance(error, openai.RateLimitError):
             if (
