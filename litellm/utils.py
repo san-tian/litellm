@@ -6676,9 +6676,13 @@ def check_valid_key(model: str, api_key: str):
 
 def _should_retry(status_code: int):
     """
-    Retries on 408, 409, 429 and 500 errors.
+    Retries on 404, 408, 409, 429 and 500 errors.
 
-    Any client error in the 400-499 range that isn't explicitly handled (such as 400 Bad Request, 401 Unauthorized, 403 Forbidden, 404 Not Found, etc.) would not trigger a retry.
+    Any client error in the 400-499 range that isn't explicitly handled (such as 400 Bad Request, 401 Unauthorized, 403 Forbidden, etc.) would not trigger a retry.
+
+    Note: 404 ("model not found") is retried because model aggregators (e.g. Novita)
+    transiently return 404 when an upstream deployment is briefly unavailable or
+    re-routing. See https://github.com/BerriAI/litellm for context.
 
     Reimplementation of openai's should retry logic, since that one can't be imported.
     https://github.com/openai/openai-python/blob/af67cfab4210d8e497c05390ce14f39105c77519/src/openai/_base_client.py#L639
@@ -6694,6 +6698,11 @@ def _should_retry(status_code: int):
 
     # Retry on rate limits.
     if status_code == 429:
+        return True
+
+    # Retry on "model not found" — aggregators transiently return 404 when an
+    # upstream deployment is briefly unavailable / re-routing.
+    if status_code == 404:
         return True
 
     # Retry internal errors.
