@@ -1850,10 +1850,13 @@ async def _user_api_key_auth_builder(
         if (
             prisma_client is None
         ):  # if both master key + user key submitted, and user key != master key, and no db connected, raise an error
+            # Without a virtual-key DB, an unknown key is an authentication
+            # failure, not a server misconfiguration: return 401 (auth_error)
+            # instead of the confusing 400 "No connected db.".
             raise ProxyException(
-                message="No connected db.",
-                type=ProxyErrorTypes.no_db_connection,
-                code=400,
+                message="Authentication Error: invalid api key (no virtual keys configured).",
+                type=ProxyErrorTypes.auth_error,
+                code=401,
                 param=None,
             )
 
